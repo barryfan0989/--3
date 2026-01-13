@@ -7,6 +7,24 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// 記憶體暫存（無資料庫時使用）
+const memoryUsers = [];
+const memoryStrategies = [];
+let userIdCounter = 1;
+let strategyIdCounter = 1;
+let dbConnected = false;
+
+// 測試資料庫連線
+db.getConnection()
+  .then(connection => {
+    dbConnected = true;
+    console.log('資料庫連線成功，使用 MySQL');
+    connection.release();
+  })
+  .catch(err => {
+    console.log('資料庫連線失敗，使用記憶體暫存模式');
+  });
+
 // 中介軟體
 app.use(cors());
 app.use(express.json());
@@ -16,24 +34,37 @@ app.post('/register', async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    // 檢查使用者是否已存在
-    const [existingUsers] = await db.query(
-      'SELECT * FROM users WHERE username = ?',
-      [username]
-    );
+    if (dbConnected) {
+      // 使用資料庫
+      const [existingUsers] = await db.query(
+        'SELECT * FROM users WHERE username = ?',
+        [username]
+      );
 
-    if (existingUsers.length > 0) {
-      return res.status(400).json({ message: '使用者名稱已存在' });
+      if (existingUsers.length > 0) {
+        return res.status(400).json({ message: '使用者名稱已存在' });
+      }
+
+      const hashedPassword = await bcrypt.hash(password, 10);
+
+      await db.query(
+        'INSERT INTO users (username, password) VALUES (?, ?)',
+        [username, hashedPassword]
+      );
+    } else {
+      // 使用記憶體
+      const existingUser = memoryUsers.find(u => u.username === username);
+      if (existingUser) {
+        return res.status(400).json({ message: '使用者名稱已存在' });
+      }
+
+      const hashedPassword = await bcrypt.hash(password, 10);
+      memoryUsers.push({
+        id: userIdCounter++,
+        username,
+        password: hashedPassword
+      });
     }
-
-    // 加密密碼
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // 存入資料庫
-    await db.query(
-      'INSERT INTO users (username, password) VALUES (?, ?)',
-      [username, hashedPassword]
-    );
 
     res.json({ message: 'Register success' });
   } catch (error) {
@@ -47,17 +78,26 @@ app.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
 
-    // 查詢使用者
-    const [users] = await db.query(
-      'SELECT * FROM users WHERE username = ?',
-      [username]
-    );
+    let user = null;
 
-    if (users.length === 0) {
-      return res.status(401).json({ message: '帳號或密碼錯誤' });
+    if (dbConnected) {
+      // 使用資料庫
+      const [users] = await db.query(
+        'SELECT * FROM users WHERE username = ?',
+        [username]
+      );
+
+      if (users.length === 0) {
+        return res.status(401).json({ message: '帳號或密碼錯誤' });
+      }
+      user = users[0];
+    } else {
+      // 使用記憶體
+      user = memoryUsers.find(u => u.username === username);
+      if (!user) {
+        return res.status(401).json({ message: '帳號或密碼錯誤' });
+      }
     }
-
-    const user = users[0];
 
     // 驗證密碼
     const isValidPassword = await bcrypt.compare(password, user.password);
@@ -137,11 +177,25 @@ app.post('/simulate', async (req, res) => {
       suggestion = '建議改搶 3800 區並提早進場，使用快速網路';
     }
 
-    // 儲存到資料庫
-    await db.query(
-      'INSERT INTO strategies (user_id, platform, entry_time, ticket_type, network, success_rate, suggestion) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [user_id, platform, entry_time, ticket_type, network, success_rate, suggestion]
-    );
+    // 儲存到資料庫或記憶體
+    if (dbConnected) {
+      await db.query(
+        'INSERT INTO strategies (user_id, platform, entry_time, ticket_type, network, success_rate, suggestion) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [user_id, platform, entry_time, ticket_type, network, success_rate, suggestion]
+      );
+    } else {
+      memoryStrategies.push({
+        id: strategyIdCounter++,
+        user_id,
+        platform,
+        entry_time,
+        ticket_type,
+        network,
+        success_rate,
+        suggestion,
+        created_at: new Date()
+      });
+    }
 
     res.json({
       success_rate,
@@ -158,10 +212,19 @@ app.get('/history', async (req, res) => {
   try {
     const { user_id } = req.query;
 
-    const [records] = await db.query(
-      'SELECT * FROM strategies WHERE user_id = ? ORDER BY created_at DESC',
-      [user_id]
-    );
+    let records = [];
+
+    if (dbConnected) {
+      const [dbRecords] = await db.query(
+        'SELECT * FROM strategies WHERE user_id = ? ORDER BY created_at DESC',
+        [user_id]
+      );
+      records = dbRecords;
+    } else {
+      records = memoryStrategies
+        .filter(s => s.user_id == user_id)
+        .sort((a, b) => b.created_at - a.created_at);
+    }
 
     res.json(records);
   } catch (error) {
